@@ -22,6 +22,7 @@ import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targ
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import { atomicWriteFileSync, replaceOrAppendMarkedSection, removeMarkedSection } from '../src/installer/targets/shared';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -1696,6 +1697,129 @@ describe('Installer — Cursor rules file cleanup on uninstall', () => {
     // Our tool-usage block is gone.
     expect(after).not.toContain('codegraph_search');
     expect(after).not.toContain('CODEGRAPH_START');
+  });
+});
+
+describe('Installer — symlink preservation', () => {
+  const MARKER_START = '<!-- CODEGRAPH_START -->';
+  const MARKER_END = '<!-- CODEGRAPH_END -->';
+
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkTmpDir('sym');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('atomicWriteFileSync follows a symlink and writes to the real file, preserving the link', () => {
+    const realFile = path.join(tmpDir, 'real.md');
+    const linkFile = path.join(tmpDir, 'link.md');
+
+    fs.writeFileSync(realFile, 'original content');
+    fs.symlinkSync(realFile, linkFile);
+
+    atomicWriteFileSync(linkFile, 'updated via symlink');
+
+    // Symlink still exists and points to the real file
+    const lstat = fs.lstatSync(linkFile);
+    expect(lstat.isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(linkFile)).toBe(realFile);
+
+    // Real file has the new content
+    expect(fs.readFileSync(realFile, 'utf-8')).toBe('updated via symlink');
+  });
+
+  it('replaceOrAppendMarkedSection preserves a symlink when updating content', () => {
+    const realFile = path.join(tmpDir, 'real.md');
+    const linkFile = path.join(tmpDir, 'link.md');
+
+    fs.writeFileSync(realFile, 'existing text');
+    fs.symlinkSync(realFile, linkFile);
+
+    replaceOrAppendMarkedSection(linkFile, 'CODE BLOCK', MARKER_START, MARKER_END);
+
+    // Symlink preserved
+    expect(fs.lstatSync(linkFile).isSymbolicLink()).toBe(true);
+
+    // Real file contains the code block
+    expect(fs.readFileSync(realFile, 'utf-8')).toContain('CODE BLOCK');
+  });
+
+  it('replaceOrAppendMarkedSection updates an existing marker block while preserving the symlink', () => {
+    const realFile = path.join(tmpDir, 'real.md');
+    const linkFile = path.join(tmpDir, 'link.md');
+
+    const existing = [
+      'prefix line',
+      MARKER_START,
+      'old block',
+      MARKER_END,
+      'suffix line',
+    ].join('\n');
+    fs.writeFileSync(realFile, existing);
+    fs.symlinkSync(realFile, linkFile);
+
+    replaceOrAppendMarkedSection(linkFile, 'NEW BLOCK', MARKER_START, MARKER_END);
+
+    // Symlink preserved
+    expect(fs.lstatSync(linkFile).isSymbolicLink()).toBe(true);
+
+    // Real file has updated block
+    const content = fs.readFileSync(realFile, 'utf-8');
+    expect(content).toContain('prefix line');
+    expect(content).toContain('NEW BLOCK');
+    expect(content).not.toContain('old block');
+    expect(content).toContain('suffix line');
+  });
+
+  it('removeMarkedSection removes the target file content but keeps the symlink', () => {
+    const realFile = path.join(tmpDir, 'real.md');
+    const linkFile = path.join(tmpDir, 'link.md');
+
+    // File contains only the codegraph block (will become empty)
+    const content = MARKER_START + '\nblock\n' + MARKER_END;
+    fs.writeFileSync(realFile, content);
+    fs.symlinkSync(realFile, linkFile);
+
+    const result = removeMarkedSection(linkFile, MARKER_START, MARKER_END);
+    expect(result).toBe('removed');
+
+    // Symlink still exists (though now dangling)
+    expect(fs.lstatSync(linkFile).isSymbolicLink()).toBe(true);
+
+    // Real file was deleted
+    expect(fs.existsSync(realFile)).toBe(false);
+  });
+
+  it('atomicWriteFileSync handles a dangling symlink by creating the target file', () => {
+    const realFile = path.join(tmpDir, 'real.md');
+    const linkFile = path.join(tmpDir, 'link.md');
+
+    // Dangling symlink — target doesn't exist
+    fs.symlinkSync(realFile, linkFile);
+    expect(fs.existsSync(realFile)).toBe(false);
+
+    atomicWriteFileSync(linkFile, 'created via dangling symlink');
+
+    // Symlink preserved
+    expect(fs.lstatSync(linkFile).isSymbolicLink()).toBe(true);
+
+    // Target file was created
+    expect(fs.existsSync(realFile)).toBe(true);
+    expect(fs.readFileSync(realFile, 'utf-8')).toBe('created via dangling symlink');
+  });
+
+  it('atomicWriteFileSync creates a regular file when the path is not a symlink', () => {
+    const normalFile = path.join(tmpDir, 'normal.md');
+    expect(fs.existsSync(normalFile)).toBe(false);
+
+    atomicWriteFileSync(normalFile, 'just a file');
+
+    expect(fs.lstatSync(normalFile).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(normalFile, 'utf-8')).toBe('just a file');
   });
 });
 

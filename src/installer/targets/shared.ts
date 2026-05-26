@@ -73,20 +73,50 @@ export function readJsonFile(filePath: string): Record<string, any> {
 }
 
 /**
+ * If `filePath` is a symbolic link, resolve it to the real target path.
+ * Otherwise return `filePath` unchanged. Non-existent paths are returned
+ * as-is so the caller can create them normally.
+ *
+ * Handles dangling symlinks by manually resolving via readlink.
+ */
+function resolveSymlink(filePath: string): string {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return filePath;
+    throw err;
+  }
+  if (!stat.isSymbolicLink()) return filePath;
+
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    // Dangling symlink — resolve manually
+    const target = fs.readlinkSync(filePath);
+    return path.resolve(path.dirname(filePath), target);
+  }
+}
+
+/**
  * Write a file atomically: write to `<path>.tmp.<pid>`, then rename.
  *
  * Prevents corruption if the process crashes mid-write. The temp
  * file is cleaned up on rename failure.
+ *
+ * If `filePath` is a symbolic link, the write follows the link and
+ * writes to the real target file, preserving the symlink.
  */
 export function atomicWriteFileSync(filePath: string, content: string): void {
-  const dir = path.dirname(filePath);
+  const resolvedPath = resolveSymlink(filePath);
+  const dir = path.dirname(resolvedPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  const tmpPath = filePath + '.tmp.' + process.pid;
+  const tmpPath = resolvedPath + '.tmp.' + process.pid;
   try {
     fs.writeFileSync(tmpPath, content);
-    fs.renameSync(tmpPath, filePath);
+    fs.renameSync(tmpPath, resolvedPath);
   } catch (err) {
     try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
     throw err;
@@ -225,7 +255,7 @@ export function removeMarkedSection(
   const joined = before + (before && after ? '\n\n' : '') + after;
 
   if (joined.trim() === '') {
-    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+    try { fs.unlinkSync(resolveSymlink(filePath)); } catch { /* ignore */ }
   } else {
     atomicWriteFileSync(filePath, joined.trim() + '\n');
   }
